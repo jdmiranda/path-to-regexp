@@ -223,7 +223,12 @@ export function parse(str: string, options: ParseOptions = {}): TokenData {
   // Use cache for default options (most common case)
   if (encodePath === NOOP_VALUE) {
     const cached = parseCache.get(str);
-    if (cached) return cached;
+    if (cached) {
+      // touch for LRU behavior
+      parseCache.delete(str);
+      parseCache.set(str, cached);
+      return cached;
+    }
   }
   const chars = [...str];
   const tokens: Array<LexToken> = [];
@@ -534,12 +539,18 @@ export function pathToRegexp(
 
   if (isDefaultOptions && typeof path === "string" && !Array.isArray(path)) {
     const cached = patternCache.get(path);
-    if (cached) return cached;
+    if (cached) {
+      patternCache.delete(path);
+      patternCache.set(path, cached);
+      return cached;
+    }
 
     // Fast path for static routes
     if (isStaticPath(path)) {
       const cachedStatic = staticRouteCache.get(path);
       if (cachedStatic) {
+        staticRouteCache.delete(path);
+        staticRouteCache.set(path, cachedStatic);
         return { regexp: cachedStatic, keys: [] };
       }
 

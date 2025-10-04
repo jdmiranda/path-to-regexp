@@ -4,6 +4,18 @@ const ID_START = /^[$_\p{ID_Start}]$/u;
 const ID_CONTINUE = /^[$\u200c\u200d\p{ID_Continue}]$/u;
 
 /**
+ * Performance optimization caches
+ */
+const parseCache = new Map<string, TokenData>();
+const patternCache = new Map<string, { regexp: RegExp; keys: Keys }>();
+const staticRouteCache = new Map<string, RegExp>();
+
+// Cache size limits to prevent memory leaks
+const MAX_PARSE_CACHE_SIZE = 1000;
+const MAX_PATTERN_CACHE_SIZE = 500;
+const MAX_STATIC_CACHE_SIZE = 200;
+
+/**
  * Encode a string into another string.
  */
 export type Encode = (value: string) => string;
@@ -98,6 +110,25 @@ const SIMPLE_TOKENS: Record<string, TokenType> = {
 };
 
 /**
+ * Manage cache size with LRU-style eviction
+ */
+function manageCacheSize<K, V>(cache: Map<K, V>, maxSize: number): void {
+  if (cache.size >= maxSize) {
+    const firstKey = cache.keys().next().value;
+    if (firstKey !== undefined) cache.delete(firstKey);
+  }
+}
+
+/**
+ * Check if a path is a static route (no params or wildcards)
+ */
+function isStaticPath(str: string): boolean {
+  // Check for escape sequences - if there are backslashes, we need to parse properly
+  if (str.includes("\\")) return false;
+  return !str.includes(":") && !str.includes("*") && !str.includes("{");
+}
+
+/**
  * Escape text for stringify to path.
  */
 function escapeText(str: string) {
@@ -188,6 +219,12 @@ export class PathError extends TypeError {
  */
 export function parse(str: string, options: ParseOptions = {}): TokenData {
   const { encodePath = NOOP_VALUE } = options;
+
+  // Use cache for default options (most common case)
+  if (encodePath === NOOP_VALUE) {
+    const cached = parseCache.get(str);
+    if (cached) return cached;
+  }
   const chars = [...str];
   const tokens: Array<LexToken> = [];
   let index = 0;
@@ -295,7 +332,15 @@ export function parse(str: string, options: ParseOptions = {}): TokenData {
     return output;
   }
 
-  return new TokenData(consumeUntil("end"), str);
+  const result = new TokenData(consumeUntil("end"), str);
+
+  // Cache the result for default options
+  if (encodePath === NOOP_VALUE) {
+    manageCacheSize(parseCache, MAX_PARSE_CACHE_SIZE);
+    parseCache.set(str, result);
+  }
+
+  return result;
 }
 
 /**
@@ -448,6 +493,12 @@ export function match<P extends ParamData>(
     if (!m) return false;
 
     const path = m[0];
+
+    // Fast path: no params to decode
+    if (keys.length === 0) {
+      return { path, params: Object.create(null) };
+    }
+
     const params = Object.create(null);
 
     for (let i = 1; i < m.length; i++) {
@@ -472,6 +523,34 @@ export function pathToRegexp(
     sensitive = false,
     trailing = true,
   } = options;
+
+  // Create cache key for default options with string paths
+  const isDefaultOptions =
+    delimiter === DEFAULT_DELIMITER &&
+    end === true &&
+    sensitive === false &&
+    trailing === true &&
+    !options.encodePath;
+
+  if (isDefaultOptions && typeof path === "string" && !Array.isArray(path)) {
+    const cached = patternCache.get(path);
+    if (cached) return cached;
+
+    // Fast path for static routes
+    if (isStaticPath(path)) {
+      const cachedStatic = staticRouteCache.get(path);
+      if (cachedStatic) {
+        return { regexp: cachedStatic, keys: [] };
+      }
+
+      const escapedPath = escape(path);
+      const staticRegexp = new RegExp(`^${escapedPath}(?:/)?$`, "i");
+      manageCacheSize(staticRouteCache, MAX_STATIC_CACHE_SIZE);
+      staticRouteCache.set(path, staticRegexp);
+      return { regexp: staticRegexp, keys: [] };
+    }
+  }
+
   const keys: Keys = [];
   const flags = sensitive ? "" : "i";
   const sources: string[] = [];
@@ -488,7 +567,15 @@ export function pathToRegexp(
   pattern += end ? "$" : `(?=${escape(delimiter)}|$)`;
 
   const regexp = new RegExp(pattern, flags);
-  return { regexp, keys };
+  const result = { regexp, keys };
+
+  // Cache the result for default options with string paths
+  if (isDefaultOptions && typeof path === "string" && !Array.isArray(path)) {
+    manageCacheSize(patternCache, MAX_PATTERN_CACHE_SIZE);
+    patternCache.set(path, result);
+  }
+
+  return result;
 }
 
 /**
